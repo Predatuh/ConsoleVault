@@ -10,6 +10,9 @@ Folder layout (created automatically next to ConsoleVault.exe):
 import os
 import sys
 import json
+import re
+import zipfile
+import urllib.parse
 import shlex
 import shutil
 import subprocess
@@ -19,12 +22,12 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QObject, QEvent, QThread, Signal, QProcess
-from PySide6.QtGui import QFont, QKeyEvent, QWindow, QShortcut, QKeySequence
+from PySide6.QtGui import QFont, QKeyEvent, QWindow, QShortcut, QKeySequence, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QListWidget, QListWidgetItem, QLabel, QPushButton, QStackedWidget, QLineEdit,
     QFileDialog, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
-    QProgressDialog, QAbstractItemView,
+    QProgressDialog, QAbstractItemView, QTreeWidget, QTreeWidgetItem, QProgressBar, QPlainTextEdit,
 )
 
 IS_WIN = sys.platform.startswith("win")
@@ -422,6 +425,784 @@ class QTimerClock:
 
 
 # ---------------------------------------------------------------------------
+# Emulator auto-install / auto-detect / BIOS import
+# ---------------------------------------------------------------------------
+GH, SCRAPE = "github", "scrape"
+
+# key = folder name under emulators/.  src: (GH, owner/repo[, fixed_tag]) or (SCRAPE, page, regex(url, version))
+EMULATORS = {
+    "mesen": dict(name="Mesen", src=(GH, "SourMesen/Mesen2"), match=["win"]),
+    "mgba": dict(name="mGBA", src=(GH, "mgba-emu/mgba"), match=["win64"], avoid=["installer", "setup"]),
+    "rmg": dict(name="RMG", src=(GH, "Rosalie241/RMG"), match=["windows"], prefer=["portable"],
+                avoid=["setup", "installer"]),
+    "melonds": dict(name="melonDS", src=(GH, "melonDS-emu/melonDS"), match=["win"]),
+    "azahar": dict(name="Azahar", src=(GH, "azahar-emu/azahar"), match=["windows"], prefer=["msvc"],
+                   avoid=["installer", "setup"], portable_dirs=["user"]),
+    "dolphin": dict(name="Dolphin", src=(SCRAPE, "https://dolphin-emu.org/download/",
+                                         r'(https://dl\.dolphin-emu\.org/releases/(\d+)/dolphin-\d+-x64\.7z)'),
+                    portable_files=["portable.txt"]),
+    "cemu": dict(name="Cemu", src=(GH, "cemu-project/Cemu"), match=["windows"], portable_dirs=["portable"]),
+    "ryujinx": dict(name="Ryujinx", src=(GH, "Ryubing/Stable-Releases"), match=["win"],
+                    portable_dirs=["portable"]),
+    "duckstation": dict(name="DuckStation", src=(GH, "stenzek/duckstation"), match=["windows", "x64"],
+                        prefer=["release"], avoid=["sse2"], prerelease=True, portable_files=["portable.txt"]),
+    "pcsx2": dict(name="PCSX2", src=(GH, "PCSX2/pcsx2"), match=["windows"], prefer=["qt"],
+                  portable_files=["portable.ini"]),
+    "rpcs3": dict(name="RPCS3", src=(GH, "RPCS3/rpcs3-binaries-win"), match=["win64"], needs=["vcredist", "ps3fw"]),
+    "ppsspp": dict(name="PPSSPP", src=(SCRAPE, "https://www.ppsspp.org/download/",
+                                       r'((?:https://www\.ppsspp\.org)?/files/(\d+_\d+(?:_\d+)?)/ppsspp_win\.zip)')),
+    "vita3k": dict(name="Vita3K", src=(GH, "Vita3K/Vita3K", "continuous"), match=["windows"]),
+    "xemu": dict(name="xemu", src=(GH, "xemu-project/xemu"), match=["win"], prefer=["release", "x86_64"],
+                 avoid=["dbg"], needs=["xemuhdd"]),
+    "xenia": dict(name="Xenia Canary", src=(GH, "xenia-canary/xenia-canary-releases"), match=["windows"],
+                  needs=["vcredist"], portable_files=["portable.txt"]),
+    "flycast": dict(name="Flycast", src=(GH, "flyinghead/flycast"), match=["win64"]),
+}
+DEFAULT_AVOID = ["arm64", "aarch64", "arm32", "armv7", "linux", "darwin", "macos", "-mac", "_mac", "osx", "android",
+                 "apple", "debug", "pdb", "symbols", "dbgsym", "source", "appimage", "flatpak", "headless"]
+ROLLING_TAGS = {"latest", "continuous", "nightly", "preview"}
+
+PS3_UPDATE_LIST = "http://fus01.ps3.update.playstation.net/update/ps3/list/us/ps3-updatelist.txt"
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+XEMU_HDD_URL = "https://github.com/xemu-project/xemu-hdd-image/releases/latest/download/xbox_hdd.qcow2.zip"
+
+# What each console still needs that can't be downloaded (shown in the setup window)
+BIOS_NOTES = {
+    "duckstation": "PS1 BIOS from your console (import it below)",
+    "pcsx2": "PS2 BIOS from your console (import it below)",
+    "rpcs3": "PS3 firmware — downloaded from Sony automatically",
+    "ryujinx": "prod.keys + firmware from your Switch (import keys below)",
+    "xemu": "MCPX boot ROM + BIOS from your Xbox (import below)",
+    "cemu": "keys.txt only for encrypted dumps (optional)",
+    "vita3k": "Vita3K offers Sony's firmware download on first launch",
+}
+
+# (filename regex, exact size or None, emulator folder, sub-folder)
+BIOS_RULES = [
+    (r"^(prod|title)\.keys$", None, "ryujinx", "portable/system"),
+    (r"^keys\.txt$", None, "cemu", ""),
+    (r"^(bios7|bios9|firmware|dsi_bios7|dsi_bios9|dsi_firmware|dsi_nand)\.bin$", None, "melonds", ""),
+    (r"^gba_bios\.bin$", None, "mgba", ""),
+    (r"^dc_(boot|flash|nvmem)\.bin$", None, "flycast", "data"),
+    (r"^(mcpx.*|complex.*|.*xbox.*bios.*|.*cromwell.*)\.bin$", None, "xemu", "bios"),
+    (r"\.bin$", 512 * 1024, "duckstation", "bios"),       # PS1 BIOS = 512 KB
+    (r"\.(bin|rom0)$", 4 * 1024 * 1024, "pcsx2", "bios"),  # PS2 BIOS = 4 MB
+]
+
+
+def http_get(url, timeout=30):
+    headers = {"User-Agent": f"{APP_NAME}/{VERSION}"}
+    if "api.github.com" in url:
+        headers["Accept"] = "application/vnd.github+json"
+        tok = os.environ.get("CV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
+def folder_exes(key):
+    names = []
+    for s in SYSTEMS:
+        if s["folder"] == key:
+            names += [n for n in s["exes"] if n not in names]
+    return names
+
+
+def find_exe_in(folder: Path, names):
+    if not folder.exists():
+        return None
+    wanted = [n.lower() for n in names]
+    best, rank = None, 999
+    for root, dirs, files in os.walk(folder):
+        if len(Path(root).relative_to(folder).parts) >= 3:
+            dirs[:] = []
+        for f in files:
+            fl = f.lower()
+            if fl in wanted and wanted.index(fl) < rank:
+                best, rank = Path(root) / f, wanted.index(fl)
+    return best
+
+
+def pick_asset(assets, e):
+    best = None
+    for a in assets:
+        n = a["name"].lower()
+        if not (n.endswith(".zip") or n.endswith(".7z")):
+            continue
+        if any(t not in n for t in e.get("match", [])):
+            continue
+        if any(t in n for t in DEFAULT_AVOID + e.get("avoid", [])):
+            continue
+        score = sum(2 for t in e.get("prefer", []) if t in n) + (1 if n.endswith(".zip") else 0) - len(n) / 1000
+        if best is None or score > best[0]:
+            best = (score, a)
+    return best[1] if best else None
+
+
+def resolve_latest(key):
+    """-> dict(version, url, name) for the newest stable Windows build."""
+    e = EMULATORS[key]
+    src = e["src"]
+    if src[0] == GH:
+        base = f"https://api.github.com/repos/{src[1]}/releases"
+        if len(src) > 2:
+            releases = [json.load(http_get(f"{base}/tags/{src[2]}"))]
+        else:
+            releases = []
+            try:
+                releases.append(json.load(http_get(base + "/latest")))
+            except Exception:
+                pass
+            releases += json.load(http_get(base + "?per_page=20"))
+        for rel in releases:
+            if rel.get("draft"):
+                continue
+            tag = rel.get("tag_name") or ""
+            if rel.get("prerelease") and not (e.get("prerelease") or len(src) > 2 or tag.lower() in ROLLING_TAGS):
+                continue
+            a = pick_asset(rel.get("assets", []), e)
+            if a:
+                ver = tag or rel.get("name") or "?"
+                if tag.lower() in ROLLING_TAGS or len(src) > 2:
+                    ver = "build " + (a.get("updated_at") or rel.get("published_at") or "")[:10]
+                return dict(version=ver, url=a["browser_download_url"], name=a["name"])
+        raise RuntimeError("no Windows download found on its releases page")
+    page = http_get(src[1]).read().decode("utf-8", "replace")
+    m = re.search(src[2], page)
+    if not m:
+        raise RuntimeError("couldn't find the Windows download on " + src[1])
+    url = urllib.parse.urljoin(src[1], m.group(1))
+    return dict(version=m.group(2).replace("_", "."), url=url, name=url.rsplit("/", 1)[-1])
+
+
+def download_file(url, dest, progress=None, cancelled=lambda: False):
+    with http_get(url, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while chunk := r.read(512 * 1024):
+            if cancelled():
+                raise RuntimeError("cancelled")
+            f.write(chunk)
+            got += len(chunk)
+            if progress:
+                progress(got, total)
+    return dest
+
+
+def seven_zip():
+    for d in (Path(getattr(sys, "_MEIPASS", APP_DIR)), APP_DIR):
+        if (d / "7zr.exe").exists():
+            return d / "7zr.exe"
+    return shutil.which("7z") or shutil.which("7zr")
+
+
+def extract_archive(archive: Path, out: Path):
+    out.mkdir(parents=True, exist_ok=True)
+    if archive.suffix.lower() == ".zip":
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(out)
+        return
+    sz = seven_zip()
+    if not sz:
+        raise RuntimeError("7-Zip helper missing - can't open .7z files")
+    r = subprocess.run([str(sz), "x", "-y", f"-o{out}", str(archive)], capture_output=True, text=True,
+                       creationflags=0x08000000 if IS_WIN else 0)
+    if r.returncode != 0:
+        raise RuntimeError("extract failed: " + (r.stderr or r.stdout)[-300:])
+
+
+def merge_tree(src_dir: Path, dest: Path):
+    items = list(src_dir.iterdir())
+    while len(items) == 1 and items[0].is_dir():  # strip a single wrapper folder
+        src_dir = items[0]
+        items = list(src_dir.iterdir())
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in items:
+        t = dest / p.name
+        if p.is_dir():
+            shutil.copytree(p, t, dirs_exist_ok=True)
+        else:
+            shutil.copy2(p, t)
+
+
+def vcredist_installed():
+    if not IS_WIN:
+        return True
+    try:
+        import winreg
+        for path in (r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
+                     r"SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+                    if winreg.QueryValueEx(k, "Installed")[0] == 1:
+                        return True
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return False
+
+
+def run_elevated_wait(exe, args):
+    quoted = ",".join("'" + a.replace("'", "''") + "'" for a in args)
+    cmd = f"Start-Process -FilePath '{exe}' -ArgumentList {quoted} -Verb RunAs -Wait"
+    subprocess.run(["powershell", "-NoProfile", "-Command", cmd], env=clean_child_env(),
+                   creationflags=0x08000000 if IS_WIN else 0)
+
+
+def ps3_firmware_installed(folder: Path):
+    return (folder / "dev_flash" / "vsh" / "module" / "vsh.self").exists()
+
+
+def latest_ps3_firmware_url():
+    txt = http_get(PS3_UPDATE_LIST).read().decode("utf-8", "replace")
+    m = re.search(r"CDN=(https?://[^;\s]+PS3UPDAT\.PUP)", txt)
+    if not m:
+        raise RuntimeError("couldn't read Sony's PS3 update list")
+    ver = re.search(r"SystemSoftwareVersion=([\d.]+)", txt)
+    return m.group(1), (ver.group(1) if ver else "?")
+
+
+class InstallWorker(QThread):
+    log = Signal(str)
+    step = Signal(int, int, str)          # index, total, label
+    bytes = Signal(int, int)              # got, total for current download
+    installed = Signal(str, str)          # key, version
+    all_done = Signal()
+
+    def __init__(self, keys, versions, force=False):
+        super().__init__()
+        self.keys, self.versions, self.force = keys, dict(versions), force
+        self.stop = False
+        self.did_vc = False
+
+    def tmp(self):
+        d = Path(tempfile.mkdtemp(prefix="cv_"))
+        return d
+
+    def run(self):
+        for i, key in enumerate(self.keys):
+            if self.stop:
+                break
+            e = EMULATORS[key]
+            self.step.emit(i, len(self.keys), e["name"])
+            dest = EMU_DIR / key
+            try:
+                info = resolve_latest(key)
+                have = find_exe_in(dest, folder_exes(key))
+                if have and self.versions.get(key) == info["version"] and not self.force:
+                    self.log.emit(f"✔ {e['name']} is already up to date ({info['version']})")
+                else:
+                    self.log.emit(f"⬇ {e['name']} {info['version']}  —  {info['name']}")
+                    work = self.tmp()
+                    try:
+                        arc = work / info["name"]
+                        download_file(info["url"], arc, lambda g, t: self.bytes.emit(g, t), lambda: self.stop)
+                        self.log.emit("   extracting…")
+                        extract_archive(arc, work / "x")
+                        merge_tree(work / "x", dest)
+                    finally:
+                        shutil.rmtree(work, ignore_errors=True)
+                    for f in e.get("portable_files", []):
+                        (dest / f).touch(exist_ok=True)
+                    for d in e.get("portable_dirs", []):
+                        (dest / d).mkdir(exist_ok=True)
+                    for note in dest.glob("PUT_*_HERE.txt"):
+                        note.unlink(missing_ok=True)
+                    if not find_exe_in(dest, folder_exes(key)):
+                        raise RuntimeError("downloaded, but its .exe wasn't where expected")
+                    self.installed.emit(key, info["version"])
+                    self.log.emit(f"✔ {e['name']} installed")
+                for need in e.get("needs", []):
+                    self.handle_need(need, key, dest)
+            except Exception as ex:
+                self.log.emit(f"✖ {e['name']}: {ex}")
+        self.all_done.emit()
+
+    def handle_need(self, need, key, dest):
+        if need == "vcredist":
+            if self.did_vc or vcredist_installed():
+                return
+            self.did_vc = True
+            self.log.emit("⬇ Microsoft Visual C++ runtime (Windows will ask for permission)…")
+            work = self.tmp()
+            try:
+                exe = download_file(VCREDIST_URL, work / "vc_redist.x64.exe", lambda g, t: self.bytes.emit(g, t))
+                run_elevated_wait(str(exe), ["/install", "/quiet", "/norestart"])
+                self.log.emit("✔ Visual C++ runtime installed" if vcredist_installed()
+                              else "⚠ Visual C++ runtime may not have installed (permission declined?)")
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+        elif need == "ps3fw":
+            if ps3_firmware_installed(dest):
+                self.log.emit("✔ PS3 firmware already installed")
+                return
+            url, ver = latest_ps3_firmware_url()
+            self.log.emit(f"⬇ PS3 system software {ver} from Sony…")
+            work = self.tmp()
+            try:
+                pup = download_file(url, work / "PS3UPDAT.PUP", lambda g, t: self.bytes.emit(g, t),
+                                    lambda: self.stop)
+                exe = find_exe_in(dest, folder_exes(key))
+                self.log.emit("   installing into RPCS3 (an RPCS3 window will pop up — let it finish)…")
+                subprocess.run([str(exe), "--installfw", str(pup)], cwd=str(exe.parent), env=clean_child_env(),
+                               timeout=1800)
+                self.log.emit("✔ PS3 firmware installed" if ps3_firmware_installed(dest)
+                              else "⚠ Firmware install didn't finish — in RPCS3 use File > Install Firmware")
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+        elif need == "xemuhdd":
+            if any(dest.glob("*.qcow2")):
+                return
+            self.log.emit("⬇ xemu blank hard-drive image…")
+            work = self.tmp()
+            try:
+                z = download_file(XEMU_HDD_URL, work / "hdd.zip", lambda g, t: self.bytes.emit(g, t))
+                extract_archive(z, dest)
+                self.log.emit("✔ Xbox HDD image ready (still needs your MCPX + BIOS dumps)")
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+
+
+class VersionCheckWorker(QThread):
+    result = Signal(str, str)   # key, latest version (or "error: ...")
+    all_done = Signal()
+
+    def __init__(self, keys):
+        super().__init__()
+        self.keys = keys
+
+    def run(self):
+        for k in self.keys:
+            try:
+                self.result.emit(k, resolve_latest(k)["version"])
+            except Exception as ex:
+                self.result.emit(k, f"error: {ex}")
+        self.all_done.emit()
+
+
+def search_roots():
+    env = os.environ.get
+    home = Path.home()
+    roots = []
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        if env(var):
+            roots.append((Path(env(var)), 3))
+    if env("LOCALAPPDATA"):
+        roots += [(Path(env("LOCALAPPDATA")) / "Programs", 3), (Path(env("LOCALAPPDATA")), 2)]
+    if env("APPDATA"):
+        roots.append((Path(env("APPDATA")), 2))
+    for sub in ("Desktop", "Downloads", "Documents", "OneDrive", "Games", "Emulators"):
+        roots.append((home / sub, 4))
+    roots += [(home / "scoop" / "apps", 3), (home, 2)]
+    if IS_WIN:
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for base in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                             r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+                    try:
+                        with winreg.OpenKey(hive, base) as k:
+                            for i in range(winreg.QueryInfoKey(k)[0]):
+                                try:
+                                    with winreg.OpenKey(k, winreg.EnumKey(k, i)) as sk:
+                                        loc = winreg.QueryValueEx(sk, "InstallLocation")[0]
+                                        if loc:
+                                            roots.append((Path(loc), 2))
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = Path(f"{letter}:\\")
+            if drive.exists():
+                roots.append((drive, 3))
+    seen, out = set(), []
+    for p, d in roots:
+        key = os.path.normcase(str(p))
+        if key not in seen and p.exists():
+            seen.add(key)
+            out.append((p, d))
+    return out
+
+
+SKIP_DIRS = {"windows", "$recycle.bin", "system volume information", "winsxs", "node_modules", ".git",
+             "microsoft", "packages", "temp", "cache", "programdata", "appdata", "steamapps", "windowsapps"}
+
+
+class DetectWorker(QThread):
+    found = Signal(dict)  # key -> [paths]
+    log = Signal(str)
+
+    def run(self):
+        targets = {}
+        for s in SYSTEMS:
+            for x in s["exes"]:
+                targets.setdefault(x.lower(), s["folder"])
+        lib = os.path.normcase(str(EMU_DIR))
+        res = {}
+        seen = set()
+        deadline = QTimerClock.now() + 120_000
+
+        def walk(d, depth):
+            if QTimerClock.now() > deadline:
+                return
+            dn = os.path.normcase(str(d))
+            if dn in seen or dn.startswith(lib):
+                return
+            seen.add(dn)
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except OSError:
+                return
+            for en in entries:
+                try:
+                    if en.is_file(follow_symlinks=False):
+                        k = targets.get(en.name.lower())
+                        if k:
+                            res.setdefault(k, [])
+                            if en.path not in res[k]:
+                                res[k].append(en.path)
+                    elif depth > 0 and en.is_dir(follow_symlinks=False) and en.name.lower() not in SKIP_DIRS:
+                        walk(Path(en.path), depth - 1)
+                except OSError:
+                    pass
+
+        for root, depth in search_roots():
+            self.log.emit(f"Searching {root}…")
+            walk(root, depth)
+        self.found.emit(res)
+
+
+def import_bios_folder(src: Path):
+    """Copy the user's own BIOS/key dumps into each emulator's folder. Returns list of messages."""
+    msgs = []
+    for root, dirs, files in os.walk(src):
+        if len(Path(root).relative_to(src).parts) >= 3:
+            dirs[:] = []
+        for f in files:
+            p = Path(root) / f
+            name = f.lower()
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            for pat, need_size, emu, sub in BIOS_RULES:
+                if re.search(pat, name) and (need_size is None or size == need_size):
+                    dest = EMU_DIR / emu / sub
+                    dest.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dest / f)
+                    msgs.append(f"✔ {f} → {EMULATORS[emu]['name']}")
+                    break
+    return msgs
+
+
+class SetupDialog(QDialog):
+    """Auto-detect, auto-install/update emulators, and import BIOS files."""
+
+    def __init__(self, main, preselect=None, autostart=False):
+        super().__init__(main)
+        self.main = main
+        self.setWindowTitle(f"{APP_NAME} — Setup & Auto-Install")
+        self.resize(1000, 700)
+        self.worker = None
+        lay = QVBoxLayout(self)
+
+        intro = QLabel("Tick the emulators you want, then <b>Install / Update</b>. ConsoleVault downloads the "
+                       "latest stable version of each, sets it up in portable mode, and grabs official extras "
+                       "(PS3 firmware from Sony, Visual C++ runtime, xemu HDD image).<br>"
+                       "<span style='color:#9aa3b8'>BIOS files and keys aren't downloadable — dump them from your "
+                       "own consoles and use <b>Import my BIOS / keys</b>.</span>")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Emulator", "Consoles", "Status", "Latest", "Still needs"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(False)
+        self.rows = {}
+        for key, e in EMULATORS.items():
+            consoles = ", ".join(s["short"] for s in SYSTEMS if s["folder"] == key)
+            it = QTreeWidgetItem([e["name"], consoles, "", "", BIOS_NOTES.get(key, "nothing")])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setData(0, Qt.UserRole, key)
+            self.tree.addTopLevelItem(it)
+            self.rows[key] = it
+        for c, w in enumerate((150, 190, 300, 130)):
+            self.tree.setColumnWidth(c, w)
+        lay.addWidget(self.tree, 1)
+
+        r1 = QHBoxLayout()
+        self.b_all = QPushButton("Select all")
+        self.b_all.clicked.connect(lambda: self.set_all(True))
+        self.b_none = QPushButton("Select none")
+        self.b_none.clicked.connect(lambda: self.set_all(False))
+        self.b_detect = QPushButton("🔍  Detect emulators already on this PC")
+        self.b_detect.clicked.connect(self.detect)
+        self.b_check = QPushButton("↻  Check for updates")
+        self.b_check.clicked.connect(self.check_versions)
+        for b in (self.b_all, self.b_none, self.b_detect, self.b_check):
+            r1.addWidget(b)
+        lay.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        self.b_install = QPushButton("⬇  Install / Update selected")
+        self.b_install.setObjectName("play")
+        self.b_install.clicked.connect(self.install)
+        self.b_bios = QPushButton("🔑  Import my BIOS / keys…")
+        self.b_bios.clicked.connect(self.import_bios)
+        self.b_cancel = QPushButton("Stop")
+        self.b_cancel.clicked.connect(self.cancel)
+        self.b_cancel.setEnabled(False)
+        r2.addWidget(self.b_install, 2)
+        r2.addWidget(self.b_bios, 1)
+        r2.addWidget(self.b_cancel)
+        lay.addLayout(r2)
+
+        self.status = QLabel("")
+        lay.addWidget(self.status)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        lay.addWidget(self.bar)
+        self.logbox = QPlainTextEdit()
+        self.logbox.setReadOnly(True)
+        self.logbox.setFixedHeight(170)
+        lay.addWidget(self.logbox)
+
+        self.refresh_rows()
+        for key, it in self.rows.items():
+            if preselect is None:
+                on = not self.status_of(key)[1]
+            else:
+                on = key in ([preselect] if isinstance(preselect, str) else preselect)
+            it.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+        if autostart:
+            QTimer.singleShot(200, self.install)
+        else:
+            QTimer.singleShot(200, self.check_versions)
+
+    # ---- helpers
+    def versions(self):
+        return self.main.cfg.data.setdefault("emulators", {})
+
+    def status_of(self, key):
+        lib_exe = find_exe_in(EMU_DIR / key, folder_exes(key))
+        if lib_exe:
+            v = self.versions().get(key, {}).get("version")
+            return (f"Installed{(' — ' + v) if v else ''}", True)
+        for s in SYSTEMS:
+            if s["folder"] == key:
+                p = self.main.cfg.sys(s["id"]).get("exe")
+                if p and Path(p).exists():
+                    return (f"Using {p}", True)
+        return ("Not installed", False)
+
+    def refresh_rows(self):
+        for key, it in self.rows.items():
+            text, ok = self.status_of(key)
+            it.setText(2, text)
+            it.setForeground(2, QColor("#66bb6a" if ok else "#9aa3b8"))
+
+    def set_all(self, on):
+        for it in self.rows.values():
+            it.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+
+    def selected(self):
+        return [k for k, it in self.rows.items() if it.checkState(0) == Qt.Checked]
+
+    def log(self, text):
+        self.logbox.appendPlainText(text)
+
+    def busy(self, on):
+        for b in (self.b_install, self.b_detect, self.b_check, self.b_bios, self.b_all, self.b_none):
+            b.setEnabled(not on)
+        self.b_cancel.setEnabled(on)
+
+    # ---- version check
+    def check_versions(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.status.setText("Checking latest versions…")
+        self.vworker = VersionCheckWorker(list(EMULATORS))
+        self.vworker.result.connect(self.on_version)
+        self.vworker.all_done.connect(lambda: self.status.setText("Latest versions checked."))
+        self.vworker.start()
+
+    def on_version(self, key, latest):
+        it = self.rows[key]
+        if latest.startswith("error"):
+            it.setText(3, "unavailable")
+            it.setToolTip(3, latest)
+            return
+        it.setText(3, latest)
+        cur = self.versions().get(key, {}).get("version")
+        lib_exe = find_exe_in(EMU_DIR / key, folder_exes(key))
+        if lib_exe and cur and cur != latest:
+            it.setText(2, f"Update available ({cur} → {latest})")
+            it.setForeground(2, QColor("#ffb74d"))
+            it.setCheckState(0, Qt.Checked)
+
+    # ---- install
+    def install(self):
+        keys = self.selected()
+        if not keys:
+            return QMessageBox.information(self, APP_NAME, "Tick at least one emulator.")
+        vers = {k: v.get("version") for k, v in self.versions().items()}
+        self.worker = InstallWorker(keys, vers)
+        self.worker.log.connect(self.log)
+        self.worker.step.connect(lambda i, n, name: (self.status.setText(f"[{i + 1}/{n}]  {name}"),))
+        self.worker.bytes.connect(self.on_bytes)
+        self.worker.installed.connect(self.on_installed)
+        self.worker.all_done.connect(self.on_done)
+        self.busy(True)
+        self.log(f"— Installing {len(keys)} emulator(s) into {EMU_DIR}")
+        self.worker.start()
+
+    def on_bytes(self, got, total):
+        if total:
+            self.bar.setMaximum(1000)
+            self.bar.setValue(int(got * 1000 / total))
+        else:
+            self.bar.setMaximum(0)
+
+    def on_installed(self, key, version):
+        self.versions().setdefault(key, {})["version"] = version
+        for s in SYSTEMS:  # an auto-installed copy replaces any old external path
+            if s["folder"] == key:
+                self.main.cfg.sys(s["id"]).pop("exe", None)
+        self.main.cfg.save()
+        self.refresh_rows()
+
+    def on_done(self):
+        self.busy(False)
+        self.bar.setMaximum(1000)
+        self.bar.setValue(1000)
+        self.status.setText("All done.")
+        self.log("— Finished.")
+        self.refresh_rows()
+        self.main.refresh()
+
+    def cancel(self):
+        if self.worker:
+            self.worker.stop = True
+            self.log("Stopping after the current step…")
+
+    # ---- detect
+    def detect(self):
+        self.busy(True)
+        self.status.setText("Searching this PC for emulators (up to 2 minutes)…")
+        self.bar.setMaximum(0)
+        self.dworker = DetectWorker()
+        self.dworker.log.connect(self.status.setText)
+        self.dworker.found.connect(self.on_detected)
+        self.dworker.start()
+
+    def on_detected(self, found):
+        self.busy(False)
+        self.bar.setMaximum(1000)
+        self.bar.setValue(1000)
+        if not found:
+            self.status.setText("No existing emulators found.")
+            self.log("🔍 No emulators found outside your library.")
+            return
+        lines = []
+        for key, paths in found.items():
+            lines.append(f"{EMULATORS[key]['name']}:  {paths[0]}")
+            self.log(f"🔍 Found {EMULATORS[key]['name']}: {paths[0]}" +
+                     (f"  (+{len(paths) - 1} more)" if len(paths) > 1 else ""))
+        ans = QMessageBox.question(self, APP_NAME, "Found these emulators already on your PC:\n\n" +
+                                   "\n".join(lines) + "\n\nUse them instead of downloading new copies?")
+        if ans == QMessageBox.Yes:
+            for key, paths in found.items():
+                for s in SYSTEMS:
+                    if s["folder"] == key:
+                        self.main.cfg.sys(s["id"])["exe"] = paths[0]
+                self.rows[key].setCheckState(0, Qt.Unchecked)
+            self.main.cfg.save()
+            self.refresh_rows()
+            self.main.refresh()
+        self.status.setText(f"Found {len(found)} emulator(s).")
+
+    # ---- BIOS
+    def import_bios(self):
+        d = QFileDialog.getExistingDirectory(self, "Pick the folder with your BIOS / key dumps", str(Path.home()))
+        if not d:
+            return
+        msgs = import_bios_folder(Path(d))
+        for m in msgs or ["No recognised BIOS or key files in that folder."]:
+            self.log(m)
+        if msgs and any("xemu" in m.lower() or "xbox" in m.lower() for m in msgs):
+            self.log("   xemu: point Settings > System at the files in emulators\\xemu\\bios once.")
+
+    def closeEvent(self, ev):
+        if self.worker and self.worker.isRunning():
+            if QMessageBox.question(self, APP_NAME, "Installs are still running. Stop them?") != QMessageBox.Yes:
+                return ev.ignore()
+            self.worker.stop = True
+            self.worker.wait(5000)
+        super().closeEvent(ev)
+
+
+class EmulatorUpdateCheck(QThread):
+    """Background check for newer versions of emulators ConsoleVault installed."""
+    found = Signal(list)
+
+    def __init__(self, versions):
+        super().__init__()
+        self.versions = versions
+
+    def run(self):
+        out = []
+        for key, v in self.versions.items():
+            if key in EMULATORS and v.get("version") and find_exe_in(EMU_DIR / key, folder_exes(key)):
+                try:
+                    if resolve_latest(key)["version"] != v["version"]:
+                        out.append(key)
+                except Exception:
+                    pass
+        self.found.emit(out)
+
+
+def selftest_sources(download=False):
+    """CLI check used by the GitHub build: can every emulator still be found / downloaded?"""
+    import time
+    set_library(Path(tempfile.mkdtemp(prefix="cvtest_")))
+    bad = 0
+    for key, e in EMULATORS.items():
+        try:
+            info = resolve_latest(key)
+            print(f"OK   {e['name']:<14} {info['version']:<22} {info['url']}", flush=True)
+            if download:
+                work = Path(tempfile.mkdtemp())
+                arc = download_file(info["url"], work / info["name"])
+                extract_archive(arc, work / "x")
+                merge_tree(work / "x", EMU_DIR / key)
+                exe = find_exe_in(EMU_DIR / key, folder_exes(key))
+                print(f"     extracted -> exe {'FOUND ' + exe.name if exe else 'MISSING: ' + str(folder_exes(key))}",
+                      flush=True)
+                if not exe:
+                    bad += 1
+                    print("     files:", [p.name for p in (EMU_DIR / key).iterdir()][:25], flush=True)
+                shutil.rmtree(work, ignore_errors=True)
+        except Exception as ex:
+            bad += 1
+            print(f"FAIL {e['name']:<14} {ex}", flush=True)
+        time.sleep(0.3)
+    try:
+        url, ver = latest_ps3_firmware_url()
+        print(f"OK   PS3 firmware   {ver:<22} {url}")
+    except Exception as ex:
+        bad += 1
+        print(f"FAIL PS3 firmware   {ex}")
+    print(f"\n{bad} problem(s)")
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 class Config:
@@ -567,6 +1348,10 @@ class Main(QMainWindow):
         hint = QLabel("  ↑↓ consoles · → games · Enter play · F11 fullscreen")
         hint.setObjectName("hint")
         lv.addWidget(hint)
+        setupb = QPushButton("⚡  Setup && Auto-Install")
+        setupb.setStyleSheet("margin:4px 10px;padding:9px;")
+        setupb.clicked.connect(lambda: self.open_setup())
+        lv.addWidget(setupb)
         foot = QHBoxLayout()
         ver = QLabel(f"  v{VERSION}" if "__" not in VERSION else "  dev build")
         ver.setObjectName("hint")
@@ -598,6 +1383,19 @@ class Main(QMainWindow):
         ub.addWidget(later)
         self.update_bar.hide()
         rv.addWidget(self.update_bar)
+        self.emu_bar = QWidget()
+        self.emu_bar.setStyleSheet("background:#3b2f1d;border-radius:10px;")
+        eb = QHBoxLayout(self.emu_bar)
+        eb.setContentsMargins(14, 8, 8, 8)
+        self.emu_label = QLabel()
+        self.emu_label.setStyleSheet("background:transparent;font-weight:600;")
+        eb.addWidget(self.emu_label, 1)
+        eb.addWidget(self.btn("⬆  Update emulators", lambda: (self.emu_bar.hide(),
+                              self.open_setup(preselect=self.emu_update_keys, autostart=True)), "play"))
+        eb.addWidget(self.btn("Later", self.emu_bar.hide))
+        self.emu_bar.hide()
+        self.emu_update_keys = []
+        rv.addWidget(self.emu_bar)
         self.title = QLabel()
         self.title.setObjectName("title")
         self.sub = QLabel()
@@ -616,7 +1414,7 @@ class Main(QMainWindow):
         self.b_addf = self.btn("＋  Add Game Folder", self.add_game_folder)
         self.b_roms = self.btn("📁  Games Folder", lambda: open_path(self.romdir(self.cur)))
         self.b_emudir = self.btn("📁  Emulator Folder", lambda: open_path(EMU_DIR / self.cur["folder"]))
-        self.b_get = self.btn("⬇  Get Emulator", self.get_emulator)
+        self.b_get = self.btn("⬇  Install Emulator", self.get_emulator)
         for i, b in enumerate([self.b_play, self.b_emu, self.b_inside, self.b_set, self.b_get]):
             g.addWidget(b, 0, i)
         for i, b in enumerate([self.b_add, self.b_addf, self.b_roms, self.b_emudir]):
@@ -673,6 +1471,12 @@ class Main(QMainWindow):
         self.embed_timer = QTimer(self)
         self.embed_timer.timeout.connect(self.poll_embed)
         self.pad = Gamepad(self.on_pad)
+
+        if not any(self.exe(s) for s in self.systems) and not self.cfg.data.get("setup_offered"):
+            self.cfg.data["setup_offered"] = True
+            self.cfg.save()
+            QTimer.singleShot(600, lambda: self.open_setup())
+        QTimer.singleShot(4000, self.check_emulator_updates)
 
         self.pending_update = None
         self.auto_install = True   # first check right after launch installs straight away
@@ -1023,8 +1827,28 @@ class Main(QMainWindow):
 
     # ---- misc actions --------------------------------------------------
     def get_emulator(self):
-        webbrowser.open(self.cur["url"])
-        open_path(EMU_DIR / self.cur["folder"])
+        self.open_setup(preselect=self.cur["folder"], autostart=True)
+
+    def open_setup(self, preselect=None, autostart=False):
+        dlg = SetupDialog(self, preselect=preselect, autostart=autostart)
+        dlg.exec()
+        self.refresh()
+
+    def check_emulator_updates(self):
+        vers = self.cfg.data.get("emulators", {})
+        if not vers:
+            return
+        self.emu_checker = EmulatorUpdateCheck(dict(vers))
+        self.emu_checker.found.connect(self.on_emu_updates)
+        self.emu_checker.start()
+
+    def on_emu_updates(self, keys):
+        if not keys:
+            return
+        self.emu_update_keys = keys
+        names = ", ".join(EMULATORS[k]["name"] for k in keys)
+        self.emu_label.setText(f"Emulator updates available: {names}")
+        self.emu_bar.show()
 
     def open_settings(self):
         s = self.cur
@@ -1107,6 +1931,8 @@ class Main(QMainWindow):
 
 
 def main():
+    if "--check-sources" in sys.argv:
+        sys.exit(selftest_sources(download="--download" in sys.argv))
     if HAS_CT:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)

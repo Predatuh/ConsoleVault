@@ -36,10 +36,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyside6 pyinstaller
+        run: |
+          python -m pip install --upgrade pip pyside6 pyinstaller
+          Invoke-WebRequest https://www.7-zip.org/a/7zr.exe -OutFile 7zr.exe
 
       - name: Build app
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name ConsoleVault consolevault.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name ConsoleVault --add-binary "7zr.exe;." consolevault.py
 
       - name: Build installer
         shell: pwsh
@@ -61,3 +63,20 @@ jobs:
         with:
           name: ConsoleVault-Setup
           path: Output/ConsoleVault-Setup.exe
+
+  verify-sources:
+    # Checks every emulator can still be found, downloaded and unpacked on Windows. Doesn't block releases.
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check emulator downloads
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install pyside6
+          Invoke-WebRequest https://www.7-zip.org/a/7zr.exe -OutFile 7zr.exe
+          python consolevault.py --check-sources --download
