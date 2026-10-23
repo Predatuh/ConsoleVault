@@ -427,7 +427,7 @@ class QTimerClock:
 # ---------------------------------------------------------------------------
 # Emulator auto-install / auto-detect / BIOS import
 # ---------------------------------------------------------------------------
-GH, SCRAPE, GL = "github", "scrape", "gitlab"
+GH, SCRAPE, GL, FJ = "github", "scrape", "gitlab", "forgejo"
 
 # key = folder name under emulators/.  src: (GH, owner/repo[, fixed_tag]) or (SCRAPE, page, regex(url, version))
 EMULATORS = {
@@ -445,8 +445,11 @@ EMULATORS = {
          r'((?:https:)?//dl\.dolphin-emu\.org/releases/(\d+)/dolphin-\d+-x64\.7z)')],
                     portable_files=["portable.txt"]),
     "cemu": dict(name="Cemu", src=(GH, "cemu-project/Cemu"), match=["windows"], portable_dirs=["portable"]),
-    "ryujinx": dict(name="Ryujinx", src=[(GL, "https://git.ryujinx.app", "ryubing/ryujinx"),
-                                         (GH, "Ryubing/Ryujinx")], match=["win"],
+    "ryujinx": dict(name="Ryujinx", src=[(FJ, "https://git.ryujinx.app", "Ryubing/Stable-Releases"),
+                                         (FJ, "https://git.ryujinx.app", "Ryubing/Stable"),
+                                         (FJ, "https://git.ryujinx.app", "Ryubing/Ryujinx"),
+                                         (GL, "https://git.ryujinx.app", "ryubing/ryujinx")],
+                    match=["win"], avoid=["canary"],
                     portable_dirs=["portable"]),
     "duckstation": dict(name="DuckStation", src=(GH, "stenzek/duckstation"), match=["windows", "x64"],
                         prefer=["release"], avoid=["sse2"], prerelease=True, portable_files=["portable.txt"]),
@@ -575,8 +578,11 @@ def resolve_from(e, src):
                 return dict(version=rel.get("tag_name") or rel.get("name"), url=a["browser_download_url"],
                             name=a["name"])
         raise RuntimeError("no Windows download in its releases")
-    if src[0] == GH:
-        base = f"https://api.github.com/repos/{src[1]}/releases"
+    if src[0] in (GH, FJ):
+        if src[0] == FJ:  # Forgejo/Gitea speak the same release API as GitHub
+            base, src = f"{src[1]}/api/v1/repos/{src[2]}/releases", (FJ, src[2])
+        else:
+            base = f"https://api.github.com/repos/{src[1]}/releases"
         if len(src) > 2:
             releases = [json.load(http_get(f"{base}/tags/{src[2]}"))]
         else:
@@ -707,6 +713,7 @@ class InstallWorker(QThread):
         self.keys, self.versions, self.force = keys, dict(versions), force
         self.stop = False
         self.did_vc = False
+        self.failed = []
 
     def tmp(self):
         d = Path(tempfile.mkdtemp(prefix="cv_"))
@@ -749,6 +756,7 @@ class InstallWorker(QThread):
                     self.handle_need(need, key, dest)
             except Exception as ex:
                 self.log.emit(f"✖ {e['name']}: {ex}")
+                self.failed.append(key)
         self.all_done.emit()
 
     def handle_need(self, need, key, dest):
@@ -1117,6 +1125,17 @@ class SetupDialog(QDialog):
         self.log("— Finished.")
         self.refresh_rows()
         self.main.refresh()
+        failed = [k for k in self.worker.failed if k in EMULATORS]
+        if failed and not self.worker.stop:
+            names = ", ".join(EMULATORS[k]["name"] for k in failed)
+            if QMessageBox.question(self, APP_NAME, f"Couldn't download automatically: {names}\n\n"
+                                    "Open their official download pages? Unzip each one into the folder "
+                                    "that opens and ConsoleVault will pick it up.") == QMessageBox.Yes:
+                for k in failed:
+                    url = next((s["url"] for s in SYSTEMS if s["folder"] == k), None)
+                    if url:
+                        webbrowser.open(url)
+                    open_path(EMU_DIR / k)
 
     def cancel(self):
         if self.worker:

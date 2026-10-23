@@ -6,7 +6,10 @@ All your emulators in one app. Install once, it updates itself.
 1. Download **ConsoleVault-Setup.exe** from this repo's **Releases** page and run it.
 2. On first launch, pick where your emulators and games live. If you already
    have an `emulators` / `roms` folder from before, choose **Pick folder…** and select that folder.
-3. Pick a console, click **Get Emulator**, and unzip the emulator into the folder that opens.
+3. The **Setup & Auto-Install** window opens: tick the emulators you want and click **Install / Update**.
+   ConsoleVault downloads the latest stable version of each, sets it up in portable mode and grabs official
+   extras (PS3 firmware from Sony, Visual C++ runtime, xemu HDD image). **Detect emulators already on this PC**
+   reuses ones you already have. **Import my BIOS / keys** copies your own dumps into the right emulators.
 
 ConsoleVault checks for a new version every time it starts (and every 6 hours).
 When there's one, it downloads it, installs it silently and reopens itself.
