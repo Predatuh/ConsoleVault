@@ -427,7 +427,7 @@ class QTimerClock:
 # ---------------------------------------------------------------------------
 # Emulator auto-install / auto-detect / BIOS import
 # ---------------------------------------------------------------------------
-GH, SCRAPE = "github", "scrape"
+GH, SCRAPE, GL = "github", "scrape", "gitlab"
 
 # key = folder name under emulators/.  src: (GH, owner/repo[, fixed_tag]) or (SCRAPE, page, regex(url, version))
 EMULATORS = {
@@ -438,11 +438,15 @@ EMULATORS = {
     "melonds": dict(name="melonDS", src=(GH, "melonDS-emu/melonDS"), match=["win"]),
     "azahar": dict(name="Azahar", src=(GH, "azahar-emu/azahar"), match=["windows"], prefer=["msvc"],
                    avoid=["installer", "setup"], portable_dirs=["user"]),
-    "dolphin": dict(name="Dolphin", src=(SCRAPE, "https://dolphin-emu.org/download/",
-                                         r'(https://dl\.dolphin-emu\.org/releases/(\d+)/dolphin-\d+-x64\.7z)'),
+    "dolphin": dict(name="Dolphin", src=[
+        (SCRAPE, "https://dolphin-emu.org/download/",
+         r'((?:https:)?//dl\.dolphin-emu\.org/releases/(\d+)/dolphin-\d+-x64\.7z)'),
+        (SCRAPE, "https://dolphin-emu.org/download/list/releases/1/",
+         r'((?:https:)?//dl\.dolphin-emu\.org/releases/(\d+)/dolphin-\d+-x64\.7z)')],
                     portable_files=["portable.txt"]),
     "cemu": dict(name="Cemu", src=(GH, "cemu-project/Cemu"), match=["windows"], portable_dirs=["portable"]),
-    "ryujinx": dict(name="Ryujinx", src=(GH, "Ryubing/Stable-Releases"), match=["win"],
+    "ryujinx": dict(name="Ryujinx", src=[(GL, "https://git.ryujinx.app", "ryubing/ryujinx"),
+                                         (GH, "Ryubing/Ryujinx")], match=["win"],
                     portable_dirs=["portable"]),
     "duckstation": dict(name="DuckStation", src=(GH, "stenzek/duckstation"), match=["windows", "x64"],
                         prefer=["release"], avoid=["sse2"], prerelease=True, portable_files=["portable.txt"]),
@@ -492,6 +496,10 @@ BIOS_RULES = [
 
 def http_get(url, timeout=30):
     headers = {"User-Agent": f"{APP_NAME}/{VERSION}"}
+    if "github" not in url and "gitlab" not in url and "/api/" not in url:
+        headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+        headers["Accept"] = "text/html,application/xhtml+xml,*/*"
     if "api.github.com" in url:
         headers["Accept"] = "application/vnd.github+json"
         tok = os.environ.get("CV_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
@@ -540,9 +548,33 @@ def pick_asset(assets, e):
 
 
 def resolve_latest(key):
-    """-> dict(version, url, name) for the newest stable Windows build."""
+    """-> dict(version, url, name) for the newest stable Windows build. Tries each source in turn."""
     e = EMULATORS[key]
-    src = e["src"]
+    sources = e["src"] if isinstance(e["src"], list) else [e["src"]]
+    errors = []
+    for src in sources:
+        try:
+            return resolve_from(e, src)
+        except Exception as ex:
+            errors.append(f"{src[1]}: {ex}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def resolve_from(e, src):
+    if src[0] == GL:
+        proj = urllib.parse.quote(src[2], safe="")
+        rels = json.load(http_get(f"{src[1]}/api/v4/projects/{proj}/releases?per_page=20"))
+        for rel in rels:
+            if rel.get("upcoming_release"):
+                continue
+            assets = [dict(name=l.get("name") or l["url"].rsplit("/", 1)[-1],
+                           browser_download_url=l.get("direct_asset_url") or l["url"])
+                      for l in rel.get("assets", {}).get("links", [])]
+            a = pick_asset(assets, e)
+            if a:
+                return dict(version=rel.get("tag_name") or rel.get("name"), url=a["browser_download_url"],
+                            name=a["name"])
+        raise RuntimeError("no Windows download in its releases")
     if src[0] == GH:
         base = f"https://api.github.com/repos/{src[1]}/releases"
         if len(src) > 2:
