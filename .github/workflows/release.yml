@@ -1,0 +1,55 @@
+name: Build & Release
+
+# Push a tag like v1.0.1 -> GitHub builds ConsoleVault-Setup.exe and publishes it as a release.
+# Installed copies of ConsoleVault see the new release and update themselves.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stamp version and repo into the app
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          if ("${{ github.ref_type }}" -ne "tag") { $v = "0.0.0" }
+          $src = Get-Content consolevault.py -Raw
+          $src = $src.Replace('__VERSION__', $v).Replace('__REPO__', '${{ github.repository }}')
+          Set-Content consolevault.py $src -Encoding utf8NoBOM
+          "APPVER=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyside6 pyinstaller
+
+      - name: Build app
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name ConsoleVault consolevault.py
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:APPVER" installer.iss
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output/ConsoleVault-Setup.exe
+          generate_release_notes: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConsoleVault-Setup
+          path: Output/ConsoleVault-Setup.exe
