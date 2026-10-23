@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 import webbrowser
 import urllib.request
 from pathlib import Path
@@ -80,6 +81,10 @@ def choose_library(parent=None, first_run=False):
         return default
     if box.clickedButton() is pick:
         d = QFileDialog.getExistingDirectory(parent, "Pick your ConsoleVault library folder", str(Path.home()))
+        if d and FROZEN and os.path.normcase(os.path.abspath(d)).startswith(os.path.normcase(str(APP_DIR))):
+            QMessageBox.warning(parent, APP_NAME, "Pick a folder outside ConsoleVault's program folder — "
+                                                  "that folder is replaced on updates.")
+            return choose_library(parent, first_run)
         if d:
             return Path(d)
         return default if first_run else None
@@ -432,7 +437,8 @@ GH, SCRAPE, GL, FJ = "github", "scrape", "gitlab", "forgejo"
 # key = folder name under emulators/.  src: (GH, owner/repo[, fixed_tag]) or (SCRAPE, page, regex(url, version))
 EMULATORS = {
     "mesen": dict(name="Mesen", src=(GH, "SourMesen/Mesen2"), match=["win"]),
-    "mgba": dict(name="mGBA", src=(GH, "mgba-emu/mgba"), match=["win64"], avoid=["installer", "setup"]),
+    "mgba": dict(name="mGBA", src=(GH, "mgba-emu/mgba"), match=["win64"], avoid=["installer", "setup"],
+                 portable_files=["portable.ini"]),
     "rmg": dict(name="RMG", src=(GH, "Rosalie241/RMG"), match=["windows"], prefer=["portable"],
                 avoid=["setup", "installer"]),
     "melonds": dict(name="melonDS", src=(GH, "melonDS-emu/melonDS"), match=["win"]),
@@ -649,18 +655,120 @@ def extract_archive(archive: Path, out: Path):
         raise RuntimeError("extract failed: " + (r.stderr or r.stdout)[-300:])
 
 
-def merge_tree(src_dir: Path, dest: Path):
+MANIFEST = ".consolevault-files.json"
+# Things that are (or may be) the user's: settings, saves, memory cards, states, firmware, keys...
+USER_DATA_EXTS = {".ini", ".cfg", ".conf", ".toml", ".yml", ".yaml", ".json", ".xml", ".txt", ".sav", ".srm",
+                  ".state", ".ss0", ".mcd", ".mcr", ".ps2", ".bin", ".dat", ".keys", ".db", ".sqlite", ".nvmem",
+                  ".eep", ".fla", ".sra", ".mpk", ".qcow2", ".img", ".raw", ".rom", ".dsv", ".bak"}
+PROGRAM_EXTS = {".exe", ".dll", ".pdb", ".pak", ".qm", ".ttf", ".otf", ".png", ".svg", ".ico", ".qss", ".rcc"}
+
+
+def read_manifest(dest: Path):
+    """{relative path: [size, mtime_ns] as installed} or None if ConsoleVault never installed here."""
+    try:
+        data = json.loads((dest / MANIFEST).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {r: None for r in data}
+    except Exception:
+        return None
+
+
+def file_sig(p: Path):
+    st = p.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
+def archive_root(src_dir: Path):
     items = list(src_dir.iterdir())
     while len(items) == 1 and items[0].is_dir():  # strip a single wrapper folder
         src_dir = items[0]
         items = list(src_dir.iterdir())
+    return src_dir
+
+
+def ensure_not_running(dest: Path, exe_names):
+    """Refuse to update an emulator that's open (its files would be half-replaced)."""
+    for name in exe_names:
+        exe = find_exe_in(dest, [name])
+        if exe:
+            try:
+                with open(exe, "r+b"):
+                    pass
+            except PermissionError:
+                raise RuntimeError(f"{exe.name} is running — close it and try again")
+            except OSError:
+                pass
+
+
+def backup_user_files(dest: Path, key: str, manifest):
+    """Zip the emulator's small user files (settings, saves, cards) before touching anything."""
+    if not dest.exists():
+        return None
+    files = []
+    for f in dest.rglob("*"):
+        if not f.is_file() or f.name == MANIFEST:
+            continue
+        rel = f.relative_to(dest).as_posix()
+        if manifest is not None and rel in manifest:
+            continue  # a program file we installed ourselves
+        if manifest is None and f.suffix.lower() in PROGRAM_EXTS:
+            continue
+        try:
+            if f.stat().st_size <= 64 * 1024 * 1024:
+                files.append((f, rel))
+        except OSError:
+            pass
+    if not files:
+        return None
+    bdir = BASE / "backups"
+    bdir.mkdir(parents=True, exist_ok=True)
+    out = bdir / f"{key}-{datetime.now():%Y%m%d-%H%M%S}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for f, rel in files:
+            try:
+                z.write(f, rel)
+            except OSError:
+                pass
+    old = sorted(bdir.glob(f"{key}-*.zip"))
+    for extra in old[:-5]:  # keep the last 5 backups per emulator
+        extra.unlink(missing_ok=True)
+    return out
+
+
+def merge_tree(src_dir: Path, dest: Path):
+    """Install/update program files WITHOUT overwriting the user's settings or saves.
+
+    A file that already exists is only replaced if ConsoleVault installed it last time (it's in the
+    manifest). With no manifest (first install over a copy the user set up), existing settings/save-type
+    files are always kept. Nothing is ever deleted. Returns (copied, kept_user_files)."""
+    root = archive_root(src_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    for p in items:
-        t = dest / p.name
-        if p.is_dir():
-            shutil.copytree(p, t, dirs_exist_ok=True)
-        else:
-            shutil.copy2(p, t)
+    old = read_manifest(dest)
+    new_manifest, kept = {}, []
+    for f in root.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(root).as_posix()
+        target = dest / rel
+        if target.exists():
+            is_data = f.suffix.lower() in USER_DATA_EXTS
+            if old is None:
+                ours = not is_data
+            elif rel not in old:
+                ours = False                      # created by the user / the emulator, not us
+            else:                                 # we installed it - but did the user edit it since?
+                ours = (not is_data) or (old[rel] is not None and old[rel] == file_sig(target))
+            if not ours:
+                kept.append(rel)
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+        new_manifest[rel] = file_sig(target)
+    if old:  # program files from the previous version that the new one no longer ships stay ours
+        for r, sig in old.items():
+            if r not in new_manifest and r not in kept and (dest / r).exists():
+                new_manifest[r] = sig
+    (dest / MANIFEST).write_text(json.dumps(new_manifest), encoding="utf-8")
+    return len(new_manifest), kept
 
 
 def vcredist_installed():
@@ -733,13 +841,20 @@ class InstallWorker(QThread):
                     self.log.emit(f"✔ {e['name']} is already up to date ({info['version']})")
                 else:
                     self.log.emit(f"⬇ {e['name']} {info['version']}  —  {info['name']}")
+                    ensure_not_running(dest, folder_exes(key))
                     work = self.tmp()
                     try:
                         arc = work / info["name"]
                         download_file(info["url"], arc, lambda g, t: self.bytes.emit(g, t), lambda: self.stop)
                         self.log.emit("   extracting…")
                         extract_archive(arc, work / "x")
-                        merge_tree(work / "x", dest)
+                        ensure_not_running(dest, folder_exes(key))
+                        bk = backup_user_files(dest, key, read_manifest(dest))
+                        if bk:
+                            self.log.emit(f"   backed up your settings/saves → backups\\{bk.name}")
+                        _, kept = merge_tree(work / "x", dest)
+                        if kept:
+                            self.log.emit(f"   kept {len(kept)} of your own file(s) untouched")
                     finally:
                         shutil.rmtree(work, ignore_errors=True)
                     for f in e.get("portable_files", []):
@@ -1259,15 +1374,25 @@ def selftest_sources(download=False):
 class Config:
     def __init__(self):
         self.data = {"systems": {}, "custom_systems": [], "last": None}
-        if CFG_PATH.exists():
+        for path in (CFG_PATH, CFG_PATH.with_suffix(".json.bak")):
+            if not path.exists():
+                continue
             try:
-                self.data.update(json.loads(CFG_PATH.read_text(encoding="utf-8")))
-            except Exception:
-                pass
+                self.data.update(json.loads(path.read_text(encoding="utf-8")))
+                break
+            except Exception:  # unreadable: keep a copy instead of silently starting over
+                try:
+                    shutil.copy2(path, path.with_name(path.name + f".broken-{datetime.now():%Y%m%d-%H%M%S}"))
+                except OSError:
+                    pass
 
     def save(self):
         try:
-            CFG_PATH.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+            tmp = CFG_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+            if CFG_PATH.exists():
+                shutil.copy2(CFG_PATH, CFG_PATH.with_suffix(".json.bak"))
+            os.replace(tmp, CFG_PATH)  # atomic: a crash mid-save can't leave a half-written file
         except OSError:
             pass
 

@@ -15,6 +15,15 @@ ConsoleVault checks for a new version every time it starts (and every 6 hours).
 When there's one, it downloads it, installs it silently and reopens itself.
 Your emulators, games and settings are never touched by updates.
 
+## Your data is safe
+- ConsoleVault's own updates/reinstalls only replace its program folder. Your library
+  (emulators, games, saves, settings) lives in a separate folder and uninstalling leaves it alone.
+- Emulator updates never delete anything and never overwrite your settings, saves or memory cards:
+  a file is only replaced if ConsoleVault installed it and you haven't changed it since.
+- Before every emulator update, your small user files (settings, saves, cards) are zipped to
+  `backups\` in your library (last 5 per emulator kept).
+- An emulator that's running is never updated - close it first.
+
 ## Releasing an update
 1. Change `consolevault.py`, and raise the number in `VERSION` (e.g. `1.0.0` → `1.0.1`).
 2. Push / commit to `main`.
