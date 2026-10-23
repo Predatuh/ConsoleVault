@@ -41,4 +41,4 @@ Name: "{autoprograms}\ConsoleVault"; Filename: "{app}\ConsoleVault.exe"
 Name: "{autodesktop}\ConsoleVault"; Filename: "{app}\ConsoleVault.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ConsoleVault.exe"; Description: "Launch ConsoleVault"; Flags: nowait postinstall
+Filename: "{app}\ConsoleVault.exe"; Description: "Launch ConsoleVault"; Flags: nowait postinstall skipifsilent

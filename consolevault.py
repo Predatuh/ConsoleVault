@@ -1842,32 +1842,78 @@ class Main(QMainWindow):
             self.update_bar.show()
 
     def install_update(self):
-        if not self.pending_update:
+        if not self.pending_update or getattr(self, "updating", False):
             return
+        self.updating = True
+        self.update_cancelled = False
         version, url = self.pending_update
-        dest = str(Path(tempfile.gettempdir()) / f"ConsoleVault-Setup-{version}.exe")
+        dest = Path(tempfile.gettempdir()) / f"ConsoleVault-Setup-{version}.exe"
+        if dest.exists() and dest.stat().st_size > 1_000_000:   # already fully downloaded last time
+            return self.run_installer(str(dest))
         self.dl_dialog = QProgressDialog(f"Downloading ConsoleVault {version}…", "Cancel", 0, 100, self)
         self.dl_dialog.setWindowTitle(APP_NAME)
         self.dl_dialog.setWindowModality(Qt.WindowModal)
         self.dl_dialog.setMinimumDuration(0)
-        self.dl = Downloader(url, dest)
+        self.dl_dialog.setAutoClose(False)
+        self.dl_dialog.setAutoReset(False)
+        self.dl = Downloader(url, str(dest) + ".part")
         self.dl.progress.connect(lambda g, t: self.dl_dialog.setValue(int(g * 100 / t) if t else 0))
-        self.dl.done.connect(self.run_installer)
-        self.dl.failed.connect(lambda e: (self.dl_dialog.close(),
-                                          QMessageBox.warning(self, APP_NAME, f"Update download failed:\n{e}")))
-        self.dl_dialog.canceled.connect(self.dl.terminate)
+        self.dl.done.connect(lambda p: self.download_finished(p, str(dest)))
+        self.dl.failed.connect(self.download_failed)
+        self.dl_dialog.canceled.connect(self.cancel_update)
         self.dl.start()
 
-    def run_installer(self, path):
-        self.dl_dialog.close()
-        if self.dl_dialog.wasCanceled():
+    def cancel_update(self):
+        self.update_cancelled = True
+        self.updating = False
+        self.dl.terminate()
+
+    def close_dl_dialog(self):
+        try:
+            self.dl_dialog.canceled.disconnect(self.cancel_update)  # closing the dialog isn't a cancel
+        except (RuntimeError, TypeError):
+            pass
+        self.dl_dialog.hide()
+        self.dl_dialog.deleteLater()
+
+    def download_failed(self, err):
+        self.close_dl_dialog()
+        self.updating = False
+        if not self.update_cancelled:
+            QMessageBox.warning(self, APP_NAME, f"Update download failed:\n{err}")
+
+    def download_finished(self, part, final):
+        self.close_dl_dialog()
+        if self.update_cancelled:
             return
         try:
-            subprocess.Popen([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
-                             env=clean_child_env(), creationflags=0x00000008 | 0x00000200)
+            os.replace(part, final)
+        except OSError:
+            final = part
+        self.run_installer(final)
+
+    def run_installer(self, setup):
+        """Install silently, then start ConsoleVault again. A hidden helper does both after we exit."""
+        log = SETTINGS_FILE.parent / "update.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        q = lambda x: "'" + str(x).replace("'", "''") + "'"
+        script = (
+            f"Wait-Process -Id {os.getpid()} -Timeout 30 -ErrorAction SilentlyContinue; "
+            f"$p = Start-Process -FilePath {q(setup)} -ArgumentList "
+            f"'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',{q('/LOG=' + str(log))} "
+            f"-PassThru -Wait; "
+            f"if ($p.ExitCode -eq 0) {{ Remove-Item -LiteralPath {q(setup)} -ErrorAction SilentlyContinue }}; "
+            f"Start-Process -FilePath {q(sys.executable)}"
+        )
+        try:
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
+                              "-Command", script],
+                             env=clean_child_env(), creationflags=0x08000000 | 0x00000200)
         except OSError as e:
+            self.updating = False
             return QMessageBox.warning(self, APP_NAME, f"Couldn't start the updater:\n{e}")
-        QApplication.quit()  # installer replaces the files and relaunches ConsoleVault
+        self.statusBar().showMessage("Installing update — ConsoleVault will restart in a few seconds…")
+        QTimer.singleShot(300, QApplication.quit)
 
     def change_library(self):
         new = choose_library(self)

@@ -49,6 +49,18 @@ jobs:
           choco install innosetup -y --no-progress
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:APPVER" installer.iss
 
+      - name: Test silent install + silent update (same way the app updates itself)
+        shell: pwsh
+        run: |
+          foreach ($pass in 1,2) {
+            $p = Start-Process -FilePath Output\ConsoleVault-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',"/LOG=install$pass.log" -PassThru -Wait
+            "pass $pass exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { Get-Content "install$pass.log" -Tail 40; exit 1 }
+          }
+          $exe = "$env:LOCALAPPDATA\Programs\ConsoleVault\ConsoleVault.exe"
+          if (!(Test-Path $exe)) { "installed exe missing"; exit 1 }
+          "installed OK: $exe"
+
       - name: Publish release
         if: env.RELEASE_EXISTS != 'true'
         uses: softprops/action-gh-release@v2
