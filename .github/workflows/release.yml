@@ -1,10 +1,10 @@
 name: Build & Release
 
-# Push a tag like v1.0.1 -> GitHub builds ConsoleVault-Setup.exe and publishes it as a release.
-# Installed copies of ConsoleVault see the new release and update themselves.
+# Bump the number in VERSION and push to main -> GitHub builds ConsoleVault-Setup.exe
+# and publishes it as release vX.Y.Z. Installed copies see it and update themselves.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -23,12 +23,17 @@ jobs:
       - name: Stamp version and repo into the app
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          if ("${{ github.ref_type }}" -ne "tag") { $v = "0.0.0" }
+          $v = (Get-Content VERSION -Raw).Trim()
           $src = Get-Content consolevault.py -Raw
           $src = $src.Replace('__VERSION__', $v).Replace('__REPO__', '${{ github.repository }}')
           Set-Content consolevault.py $src -Encoding utf8NoBOM
           "APPVER=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+          gh release view "v$v" --repo "${{ github.repository }}" *> $null
+          $exists = if ($LASTEXITCODE -eq 0) { "true" } else { "false" }
+          "RELEASE_EXISTS=$exists" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Install build tools
         run: python -m pip install --upgrade pip pyside6 pyinstaller
@@ -43,9 +48,12 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:APPVER" installer.iss
 
       - name: Publish release
-        if: github.ref_type == 'tag'
+        if: env.RELEASE_EXISTS != 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.APPVER }}
+          name: ConsoleVault ${{ env.APPVER }}
+          target_commitish: ${{ github.sha }}
           files: Output/ConsoleVault-Setup.exe
           generate_release_notes: true
 

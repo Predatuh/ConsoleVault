@@ -13,11 +13,10 @@ When there's one, it downloads it, installs it silently and reopens itself.
 Your emulators, games and settings are never touched by updates.
 
 ## Releasing an update
-1. Change `consolevault.py` and commit it.
-2. On GitHub: **Releases → Draft a new release → Choose a tag → type a new version**
-   (e.g. `v1.0.1`, always higher than the last) → **Publish release**.
-3. GitHub Actions builds `ConsoleVault-Setup.exe` (about 5 minutes) and attaches it to that release.
-   Every installed copy updates itself on its next launch.
+1. Change `consolevault.py`, and raise the number in `VERSION` (e.g. `1.0.0` → `1.0.1`).
+2. Push / commit to `main`.
+3. GitHub Actions builds `ConsoleVault-Setup.exe` (about 5 minutes) and publishes it as release `v1.0.1`.
+   Every installed copy updates itself on its next launch. Pushes that don't change `VERSION` just build without releasing.
 
 ## Emulators
 NES/SNES Mesen · GB/GBC/GBA mGBA · N64 RMG · DS melonDS · 3DS Azahar · GameCube/Wii Dolphin ·
